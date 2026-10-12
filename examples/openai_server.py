@@ -354,8 +354,11 @@ def _load_skyrimnet_voices() -> int:
     return loaded
 
 
-async def _generate_complete_clone(req: SpeechRequest) -> tuple[np.ndarray, int]:
-    """Generate one complete clone result using the same voice coalescing as OpenAI API."""
+async def _generate_complete_clone(
+    req: SpeechRequest,
+    generation_kwargs: Optional[dict] = None,
+) -> tuple[np.ndarray, int]:
+    """Generate a complete clone result through the shared Qwen request path."""
     if tts_model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
     if not req.input.strip():
@@ -363,6 +366,7 @@ async def _generate_complete_clone(req: SpeechRequest) -> tuple[np.ndarray, int]
 
     voice_cfg, xvec = _coalesce_voice(req.voice, req)
     loop = asyncio.get_running_loop()
+    generation_kwargs = dict(generation_kwargs or {})
 
     def _generate():
         with _model_lock:
@@ -372,6 +376,7 @@ async def _generate_complete_clone(req: SpeechRequest) -> tuple[np.ndarray, int]
                 ref_audio=voice_cfg["ref_audio"],
                 ref_text=voice_cfg.get("ref_text", ""),
                 xvec_only=xvec,
+                **generation_kwargs,
             )
 
     audio_arrays, sr = await loop.run_in_executor(None, _generate)
@@ -562,10 +567,6 @@ async def skyrimnet_tts_to_audio(req: SkyrimNetSynthesisRequest):
         response_format="wav",
         language=_normalize_skyrimnet_language(req.language),
     )
-    voice_cfg, xvec = _coalesce_voice(qreq.voice, qreq)
-
-    loop = asyncio.get_running_loop()
-
     generation_kwargs = {}
     if req.temperature is not None:
         generation_kwargs["temperature"] = req.temperature
@@ -576,19 +577,7 @@ async def skyrimnet_tts_to_audio(req: SkyrimNetSynthesisRequest):
     if req.repetition_penalty is not None:
         generation_kwargs["repetition_penalty"] = req.repetition_penalty
 
-    def _generate():
-        with _model_lock:
-            return tts_model.generate_voice_clone(
-                text=qreq.input,
-                language=voice_cfg.get("language", "Auto"),
-                ref_audio=voice_cfg["ref_audio"],
-                ref_text=voice_cfg.get("ref_text", ""),
-                xvec_only=xvec,
-                **generation_kwargs,
-            )
-
-    audio_arrays, sr = await loop.run_in_executor(None, _generate)
-    audio = audio_arrays[0] if audio_arrays else np.zeros(1, dtype=np.float32)
+    audio, sr = await _generate_complete_clone(qreq, generation_kwargs)
 
     headers = {}
     if req.save_path:
@@ -626,20 +615,7 @@ async def create_speech(req: SpeechRequest):
 
     # --- MP3: generate all audio, then encode (non-streaming) ---
     if fmt == "mp3":
-        loop = asyncio.get_event_loop()
-
-        def _generate():
-            with _model_lock:
-                return tts_model.generate_voice_clone(
-                    text=req.input,
-                    language=voice_cfg.get("language", "Auto"),
-                    ref_audio=voice_cfg["ref_audio"],
-                    ref_text=voice_cfg.get("ref_text", ""),
-                    xvec_only=_xvec,
-                )
-
-        audio_arrays, sr = await loop.run_in_executor(None, _generate)
-        audio = audio_arrays[0] if audio_arrays else np.zeros(1, dtype=np.float32)
+        audio, sr = await _generate_complete_clone(req)
         return Response(content=_to_mp3_bytes(audio, sr), media_type=content_type)
 
     # --- WAV / PCM: stream chunks as they are generated ---

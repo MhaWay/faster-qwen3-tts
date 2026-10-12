@@ -109,6 +109,7 @@ class SpeechRequest(BaseModel):
     ref_audio: Optional[str] = None     # inline reference (path or base64); bypasses pool
     ref_text: Optional[str] = None      # inline reference transcript
     x_vector_only: Optional[bool] = None  # speaker-identity-only cloning; else voice/default
+    parity_mode: Optional[bool] = None     # use upstream-style talker.generate path
 
 
 class SkyrimNetSynthesisRequest(BaseModel):
@@ -371,6 +372,8 @@ async def _generate_complete_clone(
     voice_cfg, xvec = _coalesce_voice(req.voice, req)
     loop = asyncio.get_running_loop()
     generation_kwargs = dict(generation_kwargs or {})
+    if req.parity_mode is not None:
+        generation_kwargs["parity_mode"] = bool(req.parity_mode)
 
     def _generate():
         with _model_lock:

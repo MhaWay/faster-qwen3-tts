@@ -98,6 +98,7 @@ def test_skyrimnet_upload_registers_xvector_voice_and_synthesizes(client, _reset
     assert call is not None
     assert call["language"] == "Italian"
     assert call["xvec_only"] is True
+    assert call["non_streaming_mode"] is True
     assert call["ref_text"] == ""
 
 

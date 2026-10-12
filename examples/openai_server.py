@@ -193,8 +193,9 @@ def _materialize_ref(value: str) -> str:
         return value
     m = re.match(r"data:[^,;]*;base64,(.*)$", value, re.DOTALL)
     raw = m.group(1) if m else value
+    raw = re.sub(r"\s+", "", raw)
     try:
-        data = base64.b64decode(raw)
+        data = base64.b64decode(raw, validate=True)
     except Exception:
         raise HTTPException(
             status_code=400,
@@ -290,8 +291,6 @@ def _resolve_skyrimnet_voice_name(speaker_wav: Optional[str]) -> Optional[str]:
         for candidate in (speaker_wav, Path(speaker_wav).stem):
             if candidate in voices:
                 return candidate
-        if os.path.isfile(speaker_wav):
-            return speaker_wav
     return default_voice
 
 
@@ -456,7 +455,7 @@ async def skyrimnet_tts_to_audio(req: SkyrimNetSynthesisRequest):
         headers = {}
         if req.save_path:
             headers["Content-Disposition"] = (
-                f'attachment; filename="{Path(req.save_path).name}"'
+                f'attachment; filename="{Path(req.save_path).name.replace(chr(34), "_")}"'
             )
         return Response(
             content=_silence_wav_bytes(),
@@ -474,15 +473,11 @@ async def skyrimnet_tts_to_audio(req: SkyrimNetSynthesisRequest):
             ),
         )
 
-    # If speaker_wav itself is a real path, drive the request ad-hoc.
-    inline_ref = voice_name if os.path.isfile(voice_name) else None
     qreq = SpeechRequest(
         input=req.text,
-        voice=voice_name if not inline_ref else "__skyrimnet_inline__",
+        voice=voice_name,
         response_format="wav",
         language=_normalize_skyrimnet_language(req.language),
-        ref_audio=inline_ref,
-        x_vector_only=True if inline_ref else None,
     )
     voice_cfg, xvec = _coalesce_voice(qreq.voice, qreq)
 
@@ -504,7 +499,7 @@ async def skyrimnet_tts_to_audio(req: SkyrimNetSynthesisRequest):
     headers = {}
     if req.save_path:
         headers["Content-Disposition"] = (
-            f'attachment; filename="{Path(req.save_path).name}"'
+            f'attachment; filename="{Path(req.save_path).name.replace(chr(34), "_")}"'
         )
     return Response(
         content=_to_wav_bytes(audio, sr),

@@ -101,6 +101,52 @@ def test_skyrimnet_upload_registers_xvector_voice_and_synthesizes(client, _reset
     assert call["ref_text"] == ""
 
 
+def test_skyrimnet_sampling_parameters_are_forwarded(client, _reset_server_state):
+    register = client.post(
+        "/create_and_store_latents/",
+        data={"speaker_name": "serana", "language": "en"},
+        files={"wav_file": ("serana.wav", b"RIFF-test-reference", "audio/wav")},
+    )
+    assert register.status_code == 200, register.text
+
+    speech = client.post(
+        "/tts_to_audio/",
+        json={
+            "text": "We should keep moving.",
+            "speaker_wav": "serana",
+            "language": "en",
+            "temperature": 0.7,
+            "top_p": 0.85,
+            "top_k": 40,
+            "repetition_penalty": 1.1,
+        },
+    )
+
+    assert speech.status_code == 200, speech.text
+    call = _reset_server_state.last_call
+    assert call["temperature"] == 0.7
+    assert call["top_p"] == 0.85
+    assert call["top_k"] == 40
+    assert call["repetition_penalty"] == 1.1
+
+
+def test_skyrimnet_does_not_treat_arbitrary_speaker_path_as_reference(client, tmp_path):
+    local_ref = tmp_path / "private.wav"
+    local_ref.write_bytes(b"RIFF-private")
+
+    response = client.post(
+        "/tts_to_audio/",
+        json={
+            "text": "Hello.",
+            "speaker_wav": str(local_ref),
+            "language": "en",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "No SkyrimNet voice is registered" in response.json()["detail"]
+
+
 def test_skyrimnet_optional_ref_text_enables_icl_mode(client):
     response = client.post(
         "/create_and_store_latents/",

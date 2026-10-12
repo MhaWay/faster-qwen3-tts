@@ -223,7 +223,11 @@ def _coalesce_voice(voice_name: str, req: "SpeechRequest") -> tuple[dict, bool]:
             raise
     eff = dict(cfg)
     if req.language is not None:
-        eff["language"] = req.language
+        value = req.language.strip()
+        eff["language"] = _SKYRIMNET_LANGUAGE_MAP.get(value.lower(), value)
+    elif eff.get("language"):
+        value = str(eff["language"]).strip()
+        eff["language"] = _SKYRIMNET_LANGUAGE_MAP.get(value.lower(), value)
     if req.ref_text is not None:
         eff["ref_text"] = req.ref_text
     xvec = bool(eff.get("x_vector_only", False))

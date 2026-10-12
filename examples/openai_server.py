@@ -156,8 +156,9 @@ def _materialize_ref(value: str) -> str:
         return value
     m = re.match(r"data:[^,;]*;base64,(.*)$", value, re.DOTALL)
     raw = m.group(1) if m else value
+    raw = re.sub(r"\s+", "", raw)
     try:
-        data = base64.b64decode(raw)
+        data = base64.b64decode(raw, validate=True)
     except Exception:
         raise HTTPException(
             status_code=400,
@@ -391,11 +392,12 @@ def main():
         default_voice = "default"
         logger.info("Using single voice from --ref-audio: %s", args.ref_audio)
     else:
-        print(
-            "ERROR: provide --ref-audio <file> or --voices <config.json>",
-            file=sys.stderr,
+        # Valid when callers provide ref_audio dynamically on every request.
+        voices = {}
+        default_voice = None
+        logger.info(
+            "Starting without a preconfigured voice; provide ref_audio per request."
         )
-        sys.exit(1)
 
     from faster_qwen3_tts import FasterQwen3TTS
 

@@ -272,6 +272,38 @@ curl http://localhost:8000/v1/audio/speech \
 
 To expose multiple voices, pass a JSON file mapping names to reference audio configs — each `voice` value in a request will be routed to the matching entry (`--voices voices.json`). WAV and PCM formats stream chunks as they are generated; MP3 requires `pydub`.
 
+#### SkyrimNet / XTTS-compatible backend
+
+The same server also exposes the XTTS-style endpoints used by SkyrimNet:
+
+- `POST /tts_to_audio/` — synthesize a complete WAV response.
+- `POST /create_and_store_latents/` — accept SkyrimNet's multipart NPC voice upload.
+- `GET /health` — health check.
+
+No XTTS model or separate adapter process is required. When SkyrimNet uploads a voice sample without a transcript, the server registers it using Qwen3-TTS x-vector-only cloning. If a `ref_text` field is supplied, the registered voice uses ICL cloning instead.
+
+The server can be started without a preconfigured voice when SkyrimNet will upload NPC samples at runtime:
+
+```bash
+python examples/openai_server.py --port 8000
+```
+
+Point SkyrimNet's XTTS endpoint at the server URL, for example `http://192.168.1.20:8000`. Runtime samples are stored under `/tmp/faster-qwen3-tts-skyrimnet-voices` by default; set `QWEN_TTS_SKYRIMNET_VOICES_DIR` to a persistent directory if the container or server is recreated.
+
+For a direct compatibility smoke test:
+
+```bash
+curl -X POST http://localhost:8000/create_and_store_latents/ \
+  -F "speaker_name=lydia" \
+  -F "language=en" \
+  -F "wav_file=@lydia.wav"
+
+curl http://localhost:8000/tts_to_audio/ \
+  -H "Content-Type: application/json" \
+  -d '{"text":"I am sworn to carry your burdens.","speaker_wav":"lydia","language":"en","save_path":"line.wav"}' \
+  --output line.wav
+```
+
 ## Results
 
 Benchmarks include tokenization + inference (apples-to-apples with baseline). RTF > 1.0 = faster than real-time. TTFA measured as time to first playable audio chunk using streaming (chunk_size=8).

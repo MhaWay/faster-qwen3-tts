@@ -36,20 +36,24 @@ API usage:
 """
 import argparse
 import asyncio
+import base64
+import hashlib
 import io
 import json
 import logging
 import os
 import queue
+import re
 import struct
 import sys
 import threading
+from pathlib import Path
 from typing import AsyncGenerator, Optional
 
 import numpy as np
 import torch
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
@@ -69,6 +73,26 @@ voices: dict = {}
 default_voice: Optional[str] = None
 SAMPLE_RATE = 24000  # updated once the model loads
 _model_lock = threading.Lock()  # prevent concurrent GPU inference
+_skyrimnet_voice_dir = Path(
+    os.environ.get(
+        "QWEN_TTS_SKYRIMNET_VOICES_DIR",
+        "/tmp/faster-qwen3-tts-skyrimnet-voices",
+    )
+)
+
+_SKYRIMNET_LANGUAGE_MAP = {
+    "auto": "Auto",
+    "zh": "Chinese",
+    "en": "English",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "de": "German",
+    "fr": "French",
+    "ru": "Russian",
+    "pt": "Portuguese",
+    "es": "Spanish",
+    "it": "Italian",
+}
 
 # ---------------------------------------------------------------------------
 # Request / response models
@@ -81,6 +105,26 @@ class SpeechRequest(BaseModel):
     voice: str = "alloy"
     response_format: str = "wav"  # wav | pcm | mp3
     speed: float = 1.0           # accepted but not yet applied
+    language: Optional[str] = None      # override voice language for this request
+    ref_audio: Optional[str] = None     # inline reference (path or base64); bypasses pool
+    ref_text: Optional[str] = None      # inline reference transcript
+    x_vector_only: Optional[bool] = None  # speaker-identity-only cloning; else voice/default
+
+
+class SkyrimNetSynthesisRequest(BaseModel):
+    """Subset of the XTTS request schema used by SkyrimNet."""
+
+    text: str = ""
+    speaker_wav: Optional[str] = None
+    language: Optional[str] = "en"
+    accent: Optional[str] = None
+    save_path: Optional[str] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    speed: Optional[float] = None
+    repetition_penalty: Optional[float] = None
+    override: Optional[bool] = False
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +187,58 @@ def _to_mp3_bytes(pcm: np.ndarray, sample_rate: int) -> bytes:
 # ---------------------------------------------------------------------------
 
 
+def _materialize_ref(value: str) -> str:
+    """Return a filesystem path for inline ref_audio (a path, or base64 / data-URI)."""
+    if os.path.isfile(value):
+        return value
+    m = re.match(r"data:[^,;]*;base64,(.*)$", value, re.DOTALL)
+    raw = m.group(1) if m else value
+    raw = re.sub(r"\s+", "", raw)
+    try:
+        data = base64.b64decode(raw, validate=True)
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="inline ref_audio must be a filesystem path or base64 (data URI or raw)",
+        )
+    path = "/tmp/ref_" + hashlib.md5(value.encode()).hexdigest()[:16] + ".wav"
+    if not os.path.exists(path):
+        with open(path, "wb") as fh:
+            fh.write(data)
+    return path
+
+
+def _coalesce_voice(voice_name: str, req: "SpeechRequest") -> tuple[dict, bool]:
+    """Per-field coalescing: request value -> voice config -> server default.
+
+    A request that supplies ref_audio is valid even if voice_name is unknown,
+    so callers can drive an ad-hoc voice entirely over HTTP.
+    """
+    try:
+        cfg = resolve_voice(voice_name)
+    except HTTPException:
+        if getattr(req, "ref_audio", None):
+            cfg = {}
+        else:
+            raise
+    eff = dict(cfg)
+    if req.language is not None:
+        eff["language"] = req.language
+    if req.ref_text is not None:
+        eff["ref_text"] = req.ref_text
+    xvec = bool(eff.get("x_vector_only", False))
+    if req.x_vector_only is not None:
+        xvec = bool(req.x_vector_only)
+    if getattr(req, "ref_audio", None):
+        eff["ref_audio"] = _materialize_ref(req.ref_audio)
+    if not eff.get("ref_audio"):
+        raise HTTPException(
+            status_code=400,
+            detail="no reference audio available: configure a voice or pass ref_audio",
+        )
+    return eff, xvec
+
+
 def resolve_voice(voice_name: str) -> dict:
     """Return voice config dict or fall back to default, else raise 400."""
     if voice_name in voices:
@@ -164,11 +260,222 @@ def resolve_voice(voice_name: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# SkyrimNet compatibility helpers
+# ---------------------------------------------------------------------------
+
+
+def _normalize_skyrimnet_language(language: Optional[str]) -> str:
+    """Translate SkyrimNet/XTTS language codes to Qwen3-TTS language names."""
+    if not language:
+        return "Auto"
+    value = language.strip()
+    return _SKYRIMNET_LANGUAGE_MAP.get(value.lower(), value)
+
+
+def _safe_runtime_voice_name(value: str) -> str:
+    """Return a filesystem-safe runtime speaker name."""
+    stem = Path(value).stem
+    safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in stem)
+    return safe.strip("._") or "speaker"
+
+
+def _silence_wav_bytes(duration_ms: int = 100) -> bytes:
+    """Generate a short mono PCM16 silence WAV used by SkyrimNet ping probes."""
+    samples = max(1, int(SAMPLE_RATE * duration_ms / 1000))
+    return _to_wav_bytes(np.zeros(samples, dtype=np.float32), SAMPLE_RATE)
+
+
+def _resolve_skyrimnet_voice_name(speaker_wav: Optional[str]) -> Optional[str]:
+    """Resolve SkyrimNet speaker identifiers against configured/runtime voices."""
+    if speaker_wav:
+        for candidate in (speaker_wav, Path(speaker_wav).stem):
+            if candidate in voices:
+                return candidate
+    return default_voice
+
+
+def _register_voice_aliases(speaker: str, cfg: dict, audio_path: Optional[Path] = None) -> None:
+    """Register the aliases SkyrimNet may use later for the same NPC voice."""
+    voices[speaker] = cfg
+    voices[Path(speaker).stem] = cfg
+    if audio_path is not None:
+        voices[audio_path.name] = cfg
+        voices[audio_path.stem] = cfg
+
+
+def _persist_skyrimnet_voice(speaker: str, cfg: dict, audio_path: Path) -> None:
+    """Persist runtime voice metadata so container restarts do not lose registrations."""
+    _skyrimnet_voice_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = _skyrimnet_voice_dir / (
+        _safe_runtime_voice_name(speaker) + ".json"
+    )
+    payload = {
+        "speaker_name": speaker,
+        "audio_file": audio_path.name,
+        "language": cfg.get("language", "Auto"),
+        "ref_text": cfg.get("ref_text", ""),
+        "x_vector_only": bool(cfg.get("x_vector_only", False)),
+    }
+    meta_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_skyrimnet_voices() -> int:
+    """Restore persisted SkyrimNet runtime voices from sidecar metadata."""
+    if not _skyrimnet_voice_dir.exists():
+        return 0
+
+    loaded = 0
+    for meta_path in sorted(_skyrimnet_voice_dir.glob("*.json")):
+        try:
+            payload = json.loads(meta_path.read_text(encoding="utf-8"))
+            speaker = str(payload["speaker_name"])
+            audio_path = _skyrimnet_voice_dir / str(payload["audio_file"])
+            if not audio_path.is_file():
+                logger.warning(
+                    "Skipping SkyrimNet voice %s: missing audio file %s",
+                    speaker,
+                    audio_path,
+                )
+                continue
+            cfg = {
+                "ref_audio": str(audio_path),
+                "ref_text": str(payload.get("ref_text") or ""),
+                "language": str(payload.get("language") or "Auto"),
+                "x_vector_only": bool(payload.get("x_vector_only", True)),
+            }
+            _register_voice_aliases(speaker, cfg, audio_path)
+            loaded += 1
+        except Exception as exc:
+            logger.warning(
+                "Skipping invalid SkyrimNet voice metadata %s: %s",
+                meta_path,
+                exc,
+            )
+    return loaded
+
+
+async def _generate_complete_clone(
+    req: SpeechRequest,
+    generation_kwargs: Optional[dict] = None,
+) -> tuple[np.ndarray, int]:
+    """Generate a complete clone result through the shared Qwen request path."""
+    if tts_model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    if not req.input.strip():
+        raise HTTPException(status_code=400, detail="'input' text is empty")
+
+    voice_cfg, xvec = _coalesce_voice(req.voice, req)
+    loop = asyncio.get_running_loop()
+    generation_kwargs = dict(generation_kwargs or {})
+
+    def _generate():
+        with _model_lock:
+            return tts_model.generate_voice_clone(
+                text=req.input,
+                language=voice_cfg.get("language", "Auto"),
+                ref_audio=voice_cfg["ref_audio"],
+                ref_text=voice_cfg.get("ref_text", ""),
+                xvec_only=xvec,
+                **generation_kwargs,
+            )
+
+    audio_arrays, sr = await loop.run_in_executor(None, _generate)
+    audio = audio_arrays[0] if audio_arrays else np.zeros(1, dtype=np.float32)
+    return audio, sr
+
+
+async def _register_skyrimnet_voice(request: Request) -> dict:
+    """Accept SkyrimNet's multipart voice upload and register it for Qwen cloning.
+
+    SkyrimNet does not provide the reference transcript used by Qwen ICL cloning,
+    so uploads default to x-vector-only cloning. A caller may optionally provide
+    ref_text; when present, regular ICL cloning is used instead.
+    """
+    content_type = request.headers.get("content-type", "")
+    fields: dict = {}
+    upload = None
+
+    if "application/json" in content_type:
+        data = await request.json()
+        if isinstance(data, dict):
+            fields = data
+    elif (
+        "multipart/form-data" in content_type
+        or "application/x-www-form-urlencoded" in content_type
+    ):
+        form = await request.form()
+        for key, value in form.multi_items():
+            if hasattr(value, "filename") and hasattr(value, "read"):
+                if upload is None:
+                    upload = value
+                fields[key] = getattr(value, "filename", None)
+            else:
+                fields[key] = value
+
+    speaker = (
+        fields.get("speaker_name")
+        or fields.get("speaker")
+        or fields.get("speaker_wav")
+    )
+    if not speaker:
+        raise HTTPException(status_code=400, detail="speaker_name is required")
+
+    speaker = str(speaker)
+    language = _normalize_skyrimnet_language(fields.get("language"))
+    ref_text = str(fields.get("ref_text") or "")
+    ref_audio = fields.get("ref_audio")
+
+    saved_path: Optional[Path] = None
+    if upload is not None:
+        _skyrimnet_voice_dir.mkdir(parents=True, exist_ok=True)
+        saved_path = _skyrimnet_voice_dir / (
+            _safe_runtime_voice_name(speaker) + ".wav"
+        )
+        saved_path.write_bytes(await upload.read())
+        ref_audio = str(saved_path)
+    elif ref_audio:
+        ref_audio = _materialize_ref(str(ref_audio))
+        saved_path = Path(ref_audio)
+
+    if ref_audio:
+        cfg = {
+            "ref_audio": str(ref_audio),
+            "ref_text": ref_text,
+            "language": language,
+            "x_vector_only": not bool(ref_text.strip()),
+        }
+        # SkyrimNet may later send either the speaker key or "speaker.wav".
+        _register_voice_aliases(speaker, cfg, saved_path)
+        if saved_path is not None and saved_path.parent == _skyrimnet_voice_dir:
+            _persist_skyrimnet_voice(speaker, cfg, saved_path)
+
+        return {
+            "success": True,
+            "backend": "faster-qwen3-tts",
+            "speaker_name": speaker,
+            "language": language,
+            "x_vector_only": cfg["x_vector_only"],
+            "ref_audio": str(ref_audio),
+        }
+
+    # Some SkyrimNet versions probe this endpoint before a sample is attached.
+    # Keep that flow non-fatal while making it explicit that no voice was added.
+    return {
+        "success": True,
+        "backend": "faster-qwen3-tts",
+        "speaker_name": speaker,
+        "language": language,
+        "registered": False,
+        "message": "No voice sample supplied; request accepted as a compatibility no-op.",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Streaming helper: run sync generator in a background thread
 # ---------------------------------------------------------------------------
 
 
-async def _stream_chunks(voice_cfg: dict, text: str) -> AsyncGenerator[bytes, None]:
+async def _stream_chunks(voice_cfg: dict, text: str, xvec_only: bool = False) -> AsyncGenerator[bytes, None]:
     """
     Run generate_voice_clone_streaming in a background thread and yield
     raw PCM bytes for each chunk as they arrive.
@@ -185,6 +492,7 @@ async def _stream_chunks(voice_cfg: dict, text: str) -> AsyncGenerator[bytes, No
                     ref_audio=voice_cfg["ref_audio"],
                     ref_text=voice_cfg.get("ref_text", ""),
                     chunk_size=voice_cfg.get("chunk_size", 12),
+                    xvec_only=xvec_only,
                     non_streaming_mode=False,
                 ):
                     q.put(chunk)
@@ -216,6 +524,73 @@ async def health():
     return {"status": "ok", "model_loaded": tts_model is not None}
 
 
+@app.post("/create_and_store_latents")
+@app.post("/create_and_store_latents/")
+async def skyrimnet_create_and_store_latents(request: Request):
+    """Register a SkyrimNet NPC voice sample for subsequent synthesis."""
+    return await _register_skyrimnet_voice(request)
+
+
+@app.post("/tts_to_audio")
+@app.post("/tts_to_audio/")
+async def skyrimnet_tts_to_audio(req: SkyrimNetSynthesisRequest):
+    """XTTS-compatible synthesis endpoint used by SkyrimNet."""
+    if tts_model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    text = req.text.strip()
+    if not text or text == "ping":
+        headers = {}
+        if req.save_path:
+            headers["Content-Disposition"] = (
+                f'attachment; filename="{Path(req.save_path).name.replace(chr(34), "_")}"'
+            )
+        return Response(
+            content=_silence_wav_bytes(),
+            media_type="audio/wav",
+            headers=headers,
+        )
+
+    voice_name = _resolve_skyrimnet_voice_name(req.speaker_wav)
+    if not voice_name:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No SkyrimNet voice is registered. Upload one through "
+                "/create_and_store_latents or configure --ref-audio/--voices."
+            ),
+        )
+
+    qreq = SpeechRequest(
+        input=req.text,
+        voice=voice_name,
+        response_format="wav",
+        language=_normalize_skyrimnet_language(req.language),
+    )
+    generation_kwargs = {}
+    if req.temperature is not None:
+        generation_kwargs["temperature"] = req.temperature
+    if req.top_p is not None:
+        generation_kwargs["top_p"] = req.top_p
+    if req.top_k is not None:
+        generation_kwargs["top_k"] = req.top_k
+    if req.repetition_penalty is not None:
+        generation_kwargs["repetition_penalty"] = req.repetition_penalty
+
+    audio, sr = await _generate_complete_clone(qreq, generation_kwargs)
+
+    headers = {}
+    if req.save_path:
+        headers["Content-Disposition"] = (
+            f'attachment; filename="{Path(req.save_path).name.replace(chr(34), "_")}"'
+        )
+    return Response(
+        content=_to_wav_bytes(audio, sr),
+        media_type="audio/wav",
+        headers=headers,
+    )
+
+
 @app.post("/v1/audio/speech")
 async def create_speech(req: SpeechRequest):
     if tts_model is None:
@@ -223,7 +598,7 @@ async def create_speech(req: SpeechRequest):
     if not req.input.strip():
         raise HTTPException(status_code=400, detail="'input' text is empty")
 
-    voice_cfg = resolve_voice(req.voice)
+    voice_cfg, _xvec = _coalesce_voice(req.voice, req)
     fmt = req.response_format.lower()
 
     _CONTENT_TYPES = {
@@ -240,26 +615,14 @@ async def create_speech(req: SpeechRequest):
 
     # --- MP3: generate all audio, then encode (non-streaming) ---
     if fmt == "mp3":
-        loop = asyncio.get_event_loop()
-
-        def _generate():
-            with _model_lock:
-                return tts_model.generate_voice_clone(
-                    text=req.input,
-                    language=voice_cfg.get("language", "Auto"),
-                    ref_audio=voice_cfg["ref_audio"],
-                    ref_text=voice_cfg.get("ref_text", ""),
-                )
-
-        audio_arrays, sr = await loop.run_in_executor(None, _generate)
-        audio = audio_arrays[0] if audio_arrays else np.zeros(1, dtype=np.float32)
+        audio, sr = await _generate_complete_clone(req)
         return Response(content=_to_mp3_bytes(audio, sr), media_type=content_type)
 
     # --- WAV / PCM: stream chunks as they are generated ---
     async def audio_stream():
         if fmt == "wav":
             yield _wav_header(SAMPLE_RATE)  # stream with unknown data length
-        async for raw_chunk in _stream_chunks(voice_cfg, req.input):
+        async for raw_chunk in _stream_chunks(voice_cfg, req.input, _xvec):
             yield raw_chunk
 
     return StreamingResponse(audio_stream(), media_type=content_type)
@@ -331,11 +694,21 @@ def main():
         default_voice = "default"
         logger.info("Using single voice from --ref-audio: %s", args.ref_audio)
     else:
-        print(
-            "ERROR: provide --ref-audio <file> or --voices <config.json>",
-            file=sys.stderr,
+        # Valid for per-request OpenAI ref_audio and SkyrimNet runtime uploads.
+        voices = {}
+        default_voice = None
+        logger.info(
+            "Starting without a preconfigured voice; provide ref_audio per request "
+            "or register SkyrimNet voices at /create_and_store_latents."
         )
-        sys.exit(1)
+
+    restored = _load_skyrimnet_voices()
+    if restored:
+        logger.info(
+            "Restored %d persisted SkyrimNet runtime voice(s) from %s",
+            restored,
+            _skyrimnet_voice_dir,
+        )
 
     from faster_qwen3_tts import FasterQwen3TTS
 

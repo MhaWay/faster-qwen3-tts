@@ -294,6 +294,91 @@ def _resolve_skyrimnet_voice_name(speaker_wav: Optional[str]) -> Optional[str]:
     return default_voice
 
 
+def _register_voice_aliases(speaker: str, cfg: dict, audio_path: Optional[Path] = None) -> None:
+    """Register the aliases SkyrimNet may use later for the same NPC voice."""
+    voices[speaker] = cfg
+    voices[Path(speaker).stem] = cfg
+    if audio_path is not None:
+        voices[audio_path.name] = cfg
+        voices[audio_path.stem] = cfg
+
+
+def _persist_skyrimnet_voice(speaker: str, cfg: dict, audio_path: Path) -> None:
+    """Persist runtime voice metadata so container restarts do not lose registrations."""
+    _skyrimnet_voice_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = _skyrimnet_voice_dir / (
+        _safe_runtime_voice_name(speaker) + ".json"
+    )
+    payload = {
+        "speaker_name": speaker,
+        "audio_file": audio_path.name,
+        "language": cfg.get("language", "Auto"),
+        "ref_text": cfg.get("ref_text", ""),
+        "x_vector_only": bool(cfg.get("x_vector_only", False)),
+    }
+    meta_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_skyrimnet_voices() -> int:
+    """Restore persisted SkyrimNet runtime voices from sidecar metadata."""
+    if not _skyrimnet_voice_dir.exists():
+        return 0
+
+    loaded = 0
+    for meta_path in sorted(_skyrimnet_voice_dir.glob("*.json")):
+        try:
+            payload = json.loads(meta_path.read_text(encoding="utf-8"))
+            speaker = str(payload["speaker_name"])
+            audio_path = _skyrimnet_voice_dir / str(payload["audio_file"])
+            if not audio_path.is_file():
+                logger.warning(
+                    "Skipping SkyrimNet voice %s: missing audio file %s",
+                    speaker,
+                    audio_path,
+                )
+                continue
+            cfg = {
+                "ref_audio": str(audio_path),
+                "ref_text": str(payload.get("ref_text") or ""),
+                "language": str(payload.get("language") or "Auto"),
+                "x_vector_only": bool(payload.get("x_vector_only", True)),
+            }
+            _register_voice_aliases(speaker, cfg, audio_path)
+            loaded += 1
+        except Exception as exc:
+            logger.warning(
+                "Skipping invalid SkyrimNet voice metadata %s: %s",
+                meta_path,
+                exc,
+            )
+    return loaded
+
+
+async def _generate_complete_clone(req: SpeechRequest) -> tuple[np.ndarray, int]:
+    """Generate one complete clone result using the same voice coalescing as OpenAI API."""
+    if tts_model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    if not req.input.strip():
+        raise HTTPException(status_code=400, detail="'input' text is empty")
+
+    voice_cfg, xvec = _coalesce_voice(req.voice, req)
+    loop = asyncio.get_running_loop()
+
+    def _generate():
+        with _model_lock:
+            return tts_model.generate_voice_clone(
+                text=req.input,
+                language=voice_cfg.get("language", "Auto"),
+                ref_audio=voice_cfg["ref_audio"],
+                ref_text=voice_cfg.get("ref_text", ""),
+                xvec_only=xvec,
+            )
+
+    audio_arrays, sr = await loop.run_in_executor(None, _generate)
+    audio = audio_arrays[0] if audio_arrays else np.zeros(1, dtype=np.float32)
+    return audio, sr
+
+
 async def _register_skyrimnet_voice(request: Request) -> dict:
     """Accept SkyrimNet's multipart voice upload and register it for Qwen cloning.
 
@@ -355,11 +440,9 @@ async def _register_skyrimnet_voice(request: Request) -> dict:
             "x_vector_only": not bool(ref_text.strip()),
         }
         # SkyrimNet may later send either the speaker key or "speaker.wav".
-        voices[speaker] = cfg
-        voices[Path(speaker).stem] = cfg
-        if saved_path is not None:
-            voices[saved_path.name] = cfg
-            voices[saved_path.stem] = cfg
+        _register_voice_aliases(speaker, cfg, saved_path)
+        if saved_path is not None and saved_path.parent == _skyrimnet_voice_dir:
+            _persist_skyrimnet_voice(speaker, cfg, saved_path)
 
         return {
             "success": True,
@@ -641,6 +724,14 @@ def main():
         logger.info(
             "Starting without a preconfigured voice; provide ref_audio per request "
             "or register SkyrimNet voices at /create_and_store_latents."
+        )
+
+    restored = _load_skyrimnet_voices()
+    if restored:
+        logger.info(
+            "Restored %d persisted SkyrimNet runtime voice(s) from %s",
+            restored,
+            _skyrimnet_voice_dir,
         )
 
     from faster_qwen3_tts import FasterQwen3TTS

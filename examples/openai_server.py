@@ -483,6 +483,16 @@ async def skyrimnet_tts_to_audio(req: SkyrimNetSynthesisRequest):
 
     loop = asyncio.get_running_loop()
 
+    generation_kwargs = {}
+    if req.temperature is not None:
+        generation_kwargs["temperature"] = req.temperature
+    if req.top_p is not None:
+        generation_kwargs["top_p"] = req.top_p
+    if req.top_k is not None:
+        generation_kwargs["top_k"] = req.top_k
+    if req.repetition_penalty is not None:
+        generation_kwargs["repetition_penalty"] = req.repetition_penalty
+
     def _generate():
         with _model_lock:
             return tts_model.generate_voice_clone(
@@ -491,6 +501,7 @@ async def skyrimnet_tts_to_audio(req: SkyrimNetSynthesisRequest):
                 ref_audio=voice_cfg["ref_audio"],
                 ref_text=voice_cfg.get("ref_text", ""),
                 xvec_only=xvec,
+                **generation_kwargs,
             )
 
     audio_arrays, sr = await loop.run_in_executor(None, _generate)

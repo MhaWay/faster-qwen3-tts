@@ -570,8 +570,14 @@ async def skyrimnet_tts_to_audio(req: SkyrimNetSynthesisRequest):
         voice=voice_name,
         response_format="wav",
         language=_normalize_skyrimnet_language(req.language),
+        x_vector_only=True,
     )
-    generation_kwargs = {}
+    generation_kwargs = {
+        # XTTS/SkyrimNet gives us speaker identity plus the complete target text.
+        # Prefill the whole text before acoustic decode: this is substantially more
+        # stable for x-vector-only cloning than step-wise text feeding on longer lines.
+        "non_streaming_mode": True,
+    }
     if req.temperature is not None:
         generation_kwargs["temperature"] = req.temperature
     if req.top_p is not None:

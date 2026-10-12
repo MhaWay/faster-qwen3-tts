@@ -147,6 +147,25 @@ def test_skyrimnet_does_not_treat_arbitrary_speaker_path_as_reference(client, tm
     assert "No SkyrimNet voice is registered" in response.json()["detail"]
 
 
+def test_skyrimnet_runtime_voice_survives_registry_reload(client):
+    response = client.post(
+        "/create_and_store_latents/",
+        data={"speaker_name": "balgruuf", "language": "en"},
+        files={"wav_file": ("balgruuf.wav", b"RIFF-test-reference", "audio/wav")},
+    )
+    assert response.status_code == 200, response.text
+    assert "balgruuf" in server.voices
+
+    server.voices = {}
+    restored = server._load_skyrimnet_voices()
+
+    assert restored == 1
+    assert "balgruuf" in server.voices
+    assert server.voices["balgruuf"]["language"] == "English"
+    assert server.voices["balgruuf"]["x_vector_only"] is True
+    assert Path(server.voices["balgruuf"]["ref_audio"]).exists()
+
+
 def test_skyrimnet_optional_ref_text_enables_icl_mode(client):
     response = client.post(
         "/create_and_store_latents/",

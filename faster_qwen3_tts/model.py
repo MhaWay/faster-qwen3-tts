@@ -826,6 +826,7 @@ class FasterQwen3TTS:
         repetition_penalty: float = 1.05,
         xvec_only: bool = False,
         non_streaming_mode: Optional[bool] = None,
+        parity_mode: bool = False,
         append_silence: bool = True,
         instruct: Optional[str] = None,
         ref_spk: Optional[Union[str, Path]] = None,
@@ -913,6 +914,7 @@ class FasterQwen3TTS:
             top_p=top_p,
             do_sample=do_sample,
             repetition_penalty=repetition_penalty,
+            parity_mode=parity_mode,
         )
 
         if codec_ids is None:

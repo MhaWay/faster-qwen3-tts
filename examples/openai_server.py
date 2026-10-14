@@ -531,6 +531,117 @@ async def health():
     return {"status": "ok", "model_loaded": tts_model is not None}
 
 
+@app.get("/v1/audio/voices")
+async def openai_list_voices():
+    """List configured and runtime voices in an OpenAI-compatible shape."""
+    seen = set()
+    data = []
+    for name, cfg in voices.items():
+        if name in seen:
+            continue
+        seen.add(name)
+        data.append({
+            "name": name,
+            "voice": name,
+            "language": cfg.get("language", "Auto"),
+            "has_ref_text": bool(str(cfg.get("ref_text") or "").strip()),
+            "x_vector_only": bool(cfg.get("x_vector_only", False)),
+        })
+    return {"object": "list", "data": data, "voices": data}
+
+
+@app.post("/v1/audio/voices")
+async def openai_enroll_voice(request: Request):
+    """Enroll a reusable cloned voice using the vLLM/Higgs OpenAI-compatible contract.
+
+    Expected multipart fields:
+      - audio_file: uploaded reference audio
+      - consent: consent/enrollment identifier
+      - name: reusable voice name
+      - ref_text: optional reference transcript
+      - speaker_description: optional metadata
+    """
+    content_type = request.headers.get("content-type", "")
+    if "multipart/form-data" not in content_type:
+        raise HTTPException(
+            status_code=415,
+            detail="/v1/audio/voices expects multipart/form-data",
+        )
+
+    form = await request.form()
+    upload = (
+        form.get("audio_file")
+        or form.get("file")
+        or form.get("wav_file")
+        or form.get("audio")
+    )
+    if upload is None or not hasattr(upload, "read"):
+        raise HTTPException(status_code=400, detail="audio_file is required")
+
+    name = (
+        form.get("name")
+        or form.get("voice_name")
+        or form.get("speaker_name")
+        or form.get("voice")
+    )
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    name = str(name)
+
+    consent = str(form.get("consent") or form.get("consent_id") or "skyrimnet")
+    ref_text = str(form.get("ref_text") or form.get("transcript") or "").strip()
+    speaker_description = str(form.get("speaker_description") or "").strip()
+
+    _skyrimnet_voice_dir.mkdir(parents=True, exist_ok=True)
+    suffix = Path(getattr(upload, "filename", "") or "").suffix.lower()
+    if not suffix:
+        suffix = ".wav"
+    saved_path = _skyrimnet_voice_dir / (
+        _safe_runtime_voice_name(name) + suffix
+    )
+    raw = await upload.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="audio_file is empty")
+    saved_path.write_bytes(raw)
+
+    language = _normalize_skyrimnet_language(
+        str(form.get("language") or "Auto")
+    )
+    cfg = {
+        "ref_audio": str(saved_path),
+        "ref_text": ref_text,
+        "language": language,
+        "x_vector_only": not bool(ref_text),
+    }
+    _register_voice_aliases(name, cfg, saved_path)
+    _persist_skyrimnet_voice(name, cfg, saved_path)
+
+    import time
+    result = {
+        "name": name,
+        "voice": name,
+        "id": name,
+        "consent": consent,
+        "created_at": int(time.time()),
+        "mime_type": getattr(upload, "content_type", None) or "application/octet-stream",
+        "file_size": len(raw),
+        "language": language,
+        "ref_text": ref_text,
+        "x_vector_only": cfg["x_vector_only"],
+    }
+    if speaker_description:
+        result["speaker_description"] = speaker_description
+
+    logger.info(
+        "Enrolled OpenAI-compatible voice %r (%d bytes, ref_text=%s, xvec=%s)",
+        name,
+        len(raw),
+        bool(ref_text),
+        cfg["x_vector_only"],
+    )
+    return result
+
+
 @app.post("/create_and_store_latents")
 @app.post("/create_and_store_latents/")
 async def skyrimnet_create_and_store_latents(request: Request):

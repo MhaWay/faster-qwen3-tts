@@ -39,6 +39,7 @@ import asyncio
 import base64
 import hashlib
 import io
+import inspect
 import json
 import logging
 import os
@@ -321,6 +322,46 @@ def _register_voice_aliases(speaker: str, cfg: dict, audio_path: Optional[Path] 
         voices[audio_path.stem] = cfg
 
 
+def _method_accepts_kwarg(method, name: str) -> bool:
+    """Return whether a bound method accepts a keyword (or **kwargs).
+
+    The DGX image may contain a slightly older faster-qwen3-tts package than
+    this bind-mounted server file, so keep the HTTP shim backward-compatible.
+    """
+    try:
+        signature = inspect.signature(method)
+    except (TypeError, ValueError):
+        return False
+    if name in signature.parameters:
+        return True
+    return any(
+        p.kind is inspect.Parameter.VAR_KEYWORD
+        for p in signature.parameters.values()
+    )
+
+
+def _warmup_tts_model(prefill_len: int) -> None:
+    """Warm CUDA graphs across both old (_warmup) and new (warmup) APIs."""
+    method = getattr(tts_model, "warmup", None)
+    if method is None:
+        method = getattr(tts_model, "_warmup", None)
+    if method is None:
+        logger.warning(
+            "This faster-qwen3-tts build exposes no warmup method; "
+            "the first synthesis request will perform lazy graph capture"
+        )
+        return
+    method(prefill_len)
+
+
+def _generation_prompt_kwargs(method, voice_cfg: dict) -> dict:
+    """Pass a precomputed prompt only when the installed backend supports it."""
+    prompt = voice_cfg.get("_voice_clone_prompt")
+    if prompt is not None and _method_accepts_kwarg(method, "voice_clone_prompt"):
+        return {"voice_clone_prompt": prompt}
+    return {}
+
+
 def _normalize_skyrimnet_reference(raw: bytes, filename: str, output_path: Path) -> Path:
     """Decode an uploaded SkyrimNet reference into real mono PCM16 WAV.
 
@@ -399,12 +440,22 @@ def _precompute_xvector_prompt(cfg: dict) -> None:
             x_vector_only_mode=True,
         )
     spk_emb = prompt_items[0].ref_spk_embedding
-    cfg["_voice_clone_prompt"] = {
+    vcp = {
         "ref_code": [None],
         "ref_spk_embedding": [spk_emb],
         "x_vector_only_mode": [True],
         "icl_mode": [False],
     }
+    cfg["_voice_clone_prompt"] = vcp
+
+    # Older faster-qwen3-tts builds do not expose voice_clone_prompt as a
+    # generation kwarg but do have the internal reference prompt cache. Seed it
+    # so synthesis still skips speaker-encoder work.
+    prompt_cache = getattr(tts_model, "_voice_prompt_cache", None)
+    if isinstance(prompt_cache, dict):
+        cache_key = (str(ref_audio), "", True, True)
+        prompt_cache[cache_key] = (vcp, [None])
+
     logger.info(
         "Precomputed x-vector prompt for %s in %.1f ms",
         ref_audio,
@@ -481,13 +532,14 @@ async def _generate_complete_clone(
 
     def _generate():
         with _model_lock:
-            return tts_model.generate_voice_clone(
+            method = tts_model.generate_voice_clone
+            return method(
                 text=req.input,
                 language=voice_cfg.get("language", "Auto"),
                 ref_audio=voice_cfg["ref_audio"],
                 ref_text=voice_cfg.get("ref_text", ""),
                 xvec_only=xvec,
-                voice_clone_prompt=voice_cfg.get("_voice_clone_prompt"),
+                **_generation_prompt_kwargs(method, voice_cfg),
                 **generation_kwargs,
             )
 
@@ -626,7 +678,13 @@ async def _stream_chunks(
         first = True
         try:
             with _model_lock:
-                for chunk, _sr, timing in tts_model.generate_voice_clone_streaming(
+                method = tts_model.generate_voice_clone_streaming
+                prompt_kwargs = {}
+                if voice_clone_prompt is not None and _method_accepts_kwarg(
+                    method, "voice_clone_prompt"
+                ):
+                    prompt_kwargs["voice_clone_prompt"] = voice_clone_prompt
+                for chunk, _sr, timing in method(
                     text=text,
                     language=voice_cfg.get("language", "Auto"),
                     ref_audio=voice_cfg["ref_audio"],
@@ -634,7 +692,7 @@ async def _stream_chunks(
                     chunk_size=chunk_size,
                     xvec_only=xvec_only,
                     non_streaming_mode=non_streaming_mode,
-                    voice_clone_prompt=voice_clone_prompt,
+                    **prompt_kwargs,
                     **generation_kwargs,
                 ):
                     if first:
@@ -1018,7 +1076,7 @@ def main():
     # Capture CUDA graphs before accepting requests so the first NPC line does
     # not pay graph-capture latency while its lip-sync is already running.
     warm_started = time.perf_counter()
-    tts_model.warmup(prefill_len=_STARTUP_WARMUP_PREFILL)
+    _warmup_tts_model(_STARTUP_WARMUP_PREFILL)
     logger.info(
         "CUDA graph warmup completed in %.1f ms (prefill=%d)",
         (time.perf_counter() - warm_started) * 1000.0,

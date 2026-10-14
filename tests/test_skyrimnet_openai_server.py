@@ -33,6 +33,20 @@ class DummyTTS:
         self.last_call = kwargs
         return [np.zeros(240, dtype=np.float32)], self.sample_rate
 
+    def generate_voice_clone_streaming(self, **kwargs):
+        self.last_call = kwargs
+        yield (
+            np.zeros(240, dtype=np.float32),
+            self.sample_rate,
+            {
+                "prefill_ms": 10.0,
+                "decode_ms": 5.0,
+                "chunk_index": 0,
+                "chunk_steps": kwargs.get("chunk_size", 4),
+                "is_final": True,
+            },
+        )
+
 
 @pytest.fixture(autouse=True)
 def _reset_server_state(tmp_path, monkeypatch):
@@ -42,6 +56,11 @@ def _reset_server_state(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "voices", {})
     monkeypatch.setattr(server, "default_voice", None)
     monkeypatch.setattr(server, "_skyrimnet_voice_dir", tmp_path / "voices")
+    monkeypatch.setattr(server, "_XTTS_STREAMING", True)
+    monkeypatch.setattr(server, "_XTTS_CHUNK_SIZE", 4)
+    # Unit tests use intentionally tiny fake RIFF payloads; skip the real
+    # speaker-encoder precompute that production performs at enrollment time.
+    monkeypatch.setattr(server, "_precompute_xvector_prompt", lambda cfg: None)
     yield dummy
 
 
@@ -98,7 +117,8 @@ def test_skyrimnet_upload_registers_xvector_voice_and_synthesizes(client, _reset
     assert call is not None
     assert call["language"] == "Italian"
     assert call["xvec_only"] is True
-    assert call["non_streaming_mode"] is True
+    assert call["non_streaming_mode"] is False
+    assert call["chunk_size"] == 4
     assert call["ref_text"] == ""
 
 

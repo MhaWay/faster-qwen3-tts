@@ -45,8 +45,10 @@ import os
 import queue
 import re
 import struct
+import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 
@@ -73,6 +75,17 @@ voices: dict = {}
 default_voice: Optional[str] = None
 SAMPLE_RATE = 24000  # updated once the model loads
 _model_lock = threading.Lock()  # prevent concurrent GPU inference
+
+# SkyrimNet latency tuning.  Qwen3-TTS uses a 12 Hz codec, so 4 frames are
+# roughly 333 ms of audio.  Keep these configurable for compatibility testing.
+_XTTS_STREAMING = os.environ.get("QWEN_TTS_XTTS_STREAMING", "1").strip().lower() not in {
+    "0", "false", "no", "off"
+}
+_XTTS_CHUNK_SIZE = max(1, int(os.environ.get("QWEN_TTS_XTTS_CHUNK_SIZE", "4")))
+_STARTUP_WARMUP_PREFILL = max(
+    1, int(os.environ.get("QWEN_TTS_WARMUP_PREFILL", "32"))
+)
+
 _skyrimnet_voice_dir = Path(
     os.environ.get(
         "QWEN_TTS_SKYRIMNET_VOICES_DIR",
@@ -308,6 +321,97 @@ def _register_voice_aliases(speaker: str, cfg: dict, audio_path: Optional[Path] 
         voices[audio_path.stem] = cfg
 
 
+def _normalize_skyrimnet_reference(raw: bytes, filename: str, output_path: Path) -> Path:
+    """Decode an uploaded SkyrimNet reference into real mono PCM16 WAV.
+
+    Skyrim voice assets can arrive through several conversion paths.  Speaker
+    embeddings are much more stable when the encoder always receives the same
+    straightforward waveform format, regardless of the source container/codec.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    suffix = Path(filename or "reference.wav").suffix or ".wav"
+    source_path = output_path.with_name(output_path.stem + ".upload" + suffix)
+    source_path.write_bytes(raw)
+
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(source_path),
+                "-ac",
+                "1",
+                "-ar",
+                str(SAMPLE_RATE),
+                "-c:a",
+                "pcm_s16le",
+                str(output_path),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        logger.info(
+            "Normalized SkyrimNet reference %s -> mono PCM16 %d Hz",
+            filename or source_path.name,
+            SAMPLE_RATE,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        # Preserve previous behaviour as a compatibility fallback.  The DGX
+        # image ships ffmpeg, but a source checkout should still remain usable.
+        logger.warning(
+            "Could not normalize SkyrimNet reference %s with ffmpeg (%s); "
+            "storing the uploaded bytes unchanged",
+            filename or source_path.name,
+            exc,
+        )
+        output_path.write_bytes(raw)
+    finally:
+        try:
+            source_path.unlink()
+        except OSError:
+            pass
+
+    return output_path
+
+
+def _precompute_xvector_prompt(cfg: dict) -> None:
+    """Extract and cache the speaker embedding before the first synthesis call."""
+    if tts_model is None or not bool(cfg.get("x_vector_only", False)):
+        return
+    if cfg.get("_voice_clone_prompt") is not None:
+        return
+
+    ref_audio = cfg.get("ref_audio")
+    if not ref_audio:
+        return
+
+    started = time.perf_counter()
+    with _model_lock:
+        prompt_items = tts_model.model.create_voice_clone_prompt(
+            ref_audio=str(ref_audio),
+            ref_text="",
+            x_vector_only_mode=True,
+        )
+    spk_emb = prompt_items[0].ref_spk_embedding
+    cfg["_voice_clone_prompt"] = {
+        "ref_code": [None],
+        "ref_spk_embedding": [spk_emb],
+        "x_vector_only_mode": [True],
+        "icl_mode": [False],
+    }
+    logger.info(
+        "Precomputed x-vector prompt for %s in %.1f ms",
+        ref_audio,
+        (time.perf_counter() - started) * 1000.0,
+    )
+
+
 def _persist_skyrimnet_voice(speaker: str, cfg: dict, audio_path: Path) -> None:
     """Persist runtime voice metadata so container restarts do not lose registrations."""
     _skyrimnet_voice_dir.mkdir(parents=True, exist_ok=True)
@@ -383,6 +487,7 @@ async def _generate_complete_clone(
                 ref_audio=voice_cfg["ref_audio"],
                 ref_text=voice_cfg.get("ref_text", ""),
                 xvec_only=xvec,
+                voice_clone_prompt=voice_cfg.get("_voice_clone_prompt"),
                 **generation_kwargs,
             )
 
@@ -438,7 +543,14 @@ async def _register_skyrimnet_voice(request: Request) -> dict:
         saved_path = _skyrimnet_voice_dir / (
             _safe_runtime_voice_name(speaker) + ".wav"
         )
-        saved_path.write_bytes(await upload.read())
+        raw = await upload.read()
+        if not raw:
+            raise HTTPException(status_code=400, detail="wav_file is empty")
+        _normalize_skyrimnet_reference(
+            raw,
+            getattr(upload, "filename", None) or saved_path.name,
+            saved_path,
+        )
         ref_audio = str(saved_path)
     elif ref_audio:
         ref_audio = _materialize_ref(str(ref_audio))
@@ -455,6 +567,19 @@ async def _register_skyrimnet_voice(request: Request) -> dict:
         _register_voice_aliases(speaker, cfg, saved_path)
         if saved_path is not None and saved_path.parent == _skyrimnet_voice_dir:
             _persist_skyrimnet_voice(speaker, cfg, saved_path)
+
+        # Move speaker-embedding extraction out of the first spoken line.
+        # SkyrimNet already waits for enrollment, so paying this cost here
+        # removes it from the lip-sync -> first-audio critical path.
+        if cfg["x_vector_only"] and tts_model is not None:
+            loop = asyncio.get_running_loop()
+            try:
+                await loop.run_in_executor(None, _precompute_xvector_prompt, cfg)
+            except Exception:
+                logger.exception(
+                    "Failed to precompute x-vector for %s; synthesis will retry lazily",
+                    speaker,
+                )
 
         return {
             "success": True,
@@ -482,26 +607,47 @@ async def _register_skyrimnet_voice(request: Request) -> dict:
 # ---------------------------------------------------------------------------
 
 
-async def _stream_chunks(voice_cfg: dict, text: str, xvec_only: bool = False) -> AsyncGenerator[bytes, None]:
-    """
-    Run generate_voice_clone_streaming in a background thread and yield
-    raw PCM bytes for each chunk as they arrive.
-    """
+async def _stream_chunks(
+    voice_cfg: dict,
+    text: str,
+    xvec_only: bool = False,
+    generation_kwargs: Optional[dict] = None,
+) -> AsyncGenerator[bytes, None]:
+    """Run Qwen streaming generation off-thread and yield PCM16 chunks ASAP."""
     q: queue.Queue = queue.Queue()
     _DONE = object()
+    generation_kwargs = dict(generation_kwargs or {})
+    chunk_size = int(generation_kwargs.pop("chunk_size", voice_cfg.get("chunk_size", _XTTS_CHUNK_SIZE)))
+    non_streaming_mode = bool(generation_kwargs.pop("non_streaming_mode", False))
+    voice_clone_prompt = voice_cfg.get("_voice_clone_prompt")
 
     def producer():
+        started = time.perf_counter()
+        first = True
         try:
             with _model_lock:
-                for chunk, _sr, _timing in tts_model.generate_voice_clone_streaming(
+                for chunk, _sr, timing in tts_model.generate_voice_clone_streaming(
                     text=text,
                     language=voice_cfg.get("language", "Auto"),
                     ref_audio=voice_cfg["ref_audio"],
                     ref_text=voice_cfg.get("ref_text", ""),
-                    chunk_size=voice_cfg.get("chunk_size", 12),
+                    chunk_size=chunk_size,
                     xvec_only=xvec_only,
-                    non_streaming_mode=False,
+                    non_streaming_mode=non_streaming_mode,
+                    voice_clone_prompt=voice_clone_prompt,
+                    **generation_kwargs,
                 ):
+                    if first:
+                        ttfa_ms = (time.perf_counter() - started) * 1000.0
+                        logger.info(
+                            "TTS first audio chunk: %.1f ms "
+                            "(prefill %.1f ms, first decode %.1f ms, chunk=%d frames)",
+                            ttfa_ms,
+                            float(timing.get("prefill_ms", 0.0)),
+                            float(timing.get("decode_ms", 0.0)),
+                            chunk_size,
+                        )
+                        first = False
                     q.put(chunk)
         except Exception as exc:
             q.put(exc)
@@ -687,10 +833,12 @@ async def skyrimnet_tts_to_audio(req: SkyrimNetSynthesisRequest):
         x_vector_only=True,
     )
     generation_kwargs = {
-        # XTTS/SkyrimNet gives us speaker identity plus the complete target text.
-        # Prefill the whole text before acoustic decode: this is substantially more
-        # stable for x-vector-only cloning than step-wise text feeding on longer lines.
-        "non_streaming_mode": True,
+        # Critical for low TTFT: do NOT prefill the whole target sentence.
+        # Qwen can feed target text step-by-step while acoustic decode is already
+        # running.  This is also the mode that produced the clean Veronica x-vector
+        # result in our cross-language tests.
+        "non_streaming_mode": False,
+        "chunk_size": _XTTS_CHUNK_SIZE,
     }
     if req.temperature is not None:
         generation_kwargs["temperature"] = req.temperature
@@ -701,13 +849,36 @@ async def skyrimnet_tts_to_audio(req: SkyrimNetSynthesisRequest):
     if req.repetition_penalty is not None:
         generation_kwargs["repetition_penalty"] = req.repetition_penalty
 
-    audio, sr = await _generate_complete_clone(qreq, generation_kwargs)
-
     headers = {}
     if req.save_path:
         headers["Content-Disposition"] = (
             f'attachment; filename="{Path(req.save_path).name.replace(chr(34), "_")}"'
         )
+
+    if _XTTS_STREAMING:
+        voice_cfg, xvec = _coalesce_voice(voice_name, qreq)
+
+        async def xtts_audio_stream():
+            # Send the WAV header immediately, then audio as Qwen emits codec chunks.
+            yield _wav_header(SAMPLE_RATE)
+            async for raw_chunk in _stream_chunks(
+                voice_cfg,
+                qreq.input,
+                xvec,
+                generation_kwargs,
+            ):
+                yield raw_chunk
+
+        return StreamingResponse(
+            xtts_audio_stream(),
+            media_type="audio/wav",
+            headers=headers,
+        )
+
+    # Compatibility escape hatch for clients that require a complete WAV body.
+    complete_kwargs = dict(generation_kwargs)
+    complete_kwargs.pop("chunk_size", None)
+    audio, sr = await _generate_complete_clone(qreq, complete_kwargs)
     return Response(
         content=_to_wav_bytes(audio, sr),
         media_type="audio/wav",
@@ -843,7 +1014,23 @@ def main():
         dtype=torch.bfloat16,
     )
     SAMPLE_RATE = tts_model.sample_rate
+
+    # Capture CUDA graphs before accepting requests so the first NPC line does
+    # not pay graph-capture latency while its lip-sync is already running.
+    warm_started = time.perf_counter()
+    tts_model.warmup(prefill_len=_STARTUP_WARMUP_PREFILL)
+    logger.info(
+        "CUDA graph warmup completed in %.1f ms (prefill=%d)",
+        (time.perf_counter() - warm_started) * 1000.0,
+        _STARTUP_WARMUP_PREFILL,
+    )
+
     logger.info("Model ready. Sample rate: %d Hz", SAMPLE_RATE)
+    logger.info(
+        "SkyrimNet XTTS streaming=%s chunk_size=%d",
+        _XTTS_STREAMING,
+        _XTTS_CHUNK_SIZE,
+    )
     logger.info("Server listening on http://%s:%d", args.host, args.port)
 
     uvicorn.run(app, host=args.host, port=args.port)

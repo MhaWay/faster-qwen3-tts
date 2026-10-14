@@ -1083,6 +1083,31 @@ def main():
         _STARTUP_WARMUP_PREFILL,
     )
 
+    # Runtime voices are restored before the model is loaded.  Precompute their
+    # x-vectors now so an already-known NPC never pays speaker-encoder latency
+    # on the first spoken line after a server restart.  Aliases share the same
+    # config dict, so deduplicate by object identity.
+    warmed_voice_cfgs = set()
+    warmed_voices = 0
+    for cfg in voices.values():
+        cfg_id = id(cfg)
+        if cfg_id in warmed_voice_cfgs:
+            continue
+        warmed_voice_cfgs.add(cfg_id)
+        if not bool(cfg.get("x_vector_only", False)):
+            continue
+        try:
+            _precompute_xvector_prompt(cfg)
+            if cfg.get("_voice_clone_prompt") is not None:
+                warmed_voices += 1
+        except Exception:
+            logger.exception(
+                "Could not precompute startup x-vector for %s",
+                cfg.get("ref_audio"),
+            )
+    if warmed_voices:
+        logger.info("Precomputed %d x-vector voice prompt(s) at startup", warmed_voices)
+
     logger.info("Model ready. Sample rate: %d Hz", SAMPLE_RATE)
     logger.info(
         "SkyrimNet XTTS streaming=%s chunk_size=%d",
